@@ -1,0 +1,78 @@
+---
+format_version: '26'
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+project_type: ios
+
+app:
+  envs:
+  - BITRISE_PROJECT_PATH: StarPlay.xcodeproj
+    opts:
+      is_expand: false
+  - BITRISE_SCHEME: StarPlay
+    opts:
+      is_expand: false
+
+workflows:
+
+  # ── Unsigned IPA (no Apple Developer account needed) ──────────────────────
+  build_unsigned:
+    steps:
+    - git-clone@8: {}
+    - script@1:
+        title: Build unsigned IPA
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -exo pipefail
+
+            ARCHIVE_PATH="$BITRISE_DEPLOY_DIR/StarPlay.xcarchive"
+            EXPORT_DIR="$BITRISE_DEPLOY_DIR/ipa_export"
+
+            # Archive (no signing)
+            xcodebuild archive \
+              -project "$BITRISE_PROJECT_PATH" \
+              -scheme   "$BITRISE_SCHEME" \
+              -configuration Release \
+              -destination  "generic/platform=iOS" \
+              -archivePath  "$ARCHIVE_PATH" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              DEVELOPMENT_TEAM="" \
+              | xcpretty || true
+
+            # Manual IPA packaging (no ExportOptions.plist needed)
+            APP_PATH=$(find "$ARCHIVE_PATH/Products/Applications/" -name "*.app" | head -1)
+            echo "Bundled app: $APP_PATH  ($(du -sh "$APP_PATH" | cut -f1))"
+
+            mkdir -p "$EXPORT_DIR/Payload"
+            cp -r "$APP_PATH" "$EXPORT_DIR/Payload/"
+            cd "$EXPORT_DIR"
+            zip -r "$BITRISE_DEPLOY_DIR/StarPlay.ipa" Payload/
+
+            echo "IPA ready: $BITRISE_DEPLOY_DIR/StarPlay.ipa"
+
+    - deploy-to-bitrise-io@2:
+        inputs:
+        - is_compress: 'true'
+
+  # ── Signed IPA for TestFlight (requires Apple certs in Bitrise) ───────────
+  build_signed:
+    steps:
+    - git-clone@8: {}
+    - certificate-and-profile-installer@1: {}
+    - xcode-archive@4:
+        inputs:
+        - project_path: "$BITRISE_PROJECT_PATH"
+        - scheme: "$BITRISE_SCHEME"
+        - distribution_method: app-store
+        - configuration: Release
+        - automatic_code_signing: apple-id
+    - deploy-to-bitrise-io@2:
+        inputs:
+        - is_compress: 'true'
+
+meta:
+  bitrise.io:
+    stack: osx-xcode-26.5.x
+    machine_type_id: g2.mac.large
