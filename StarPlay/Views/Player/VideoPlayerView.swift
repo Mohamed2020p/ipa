@@ -1,9 +1,10 @@
 import SwiftUI
-import AVKit
 import AVFoundation
+import MobileVLCKit
 
 // MARK: - Stream State
 enum StreamState: Equatable {
+    case idle
     case loading
     case buffering
     case playing
@@ -11,51 +12,32 @@ enum StreamState: Equatable {
     case error(String)
 }
 
-// MARK: - Stream Type Detection
-private enum StreamType {
-    case hls          // .m3u8 or known HLS
-    case mpegTS       // direct .ts or bare port/id URLs (IPTV panels)
-    case unknown
-}
+// MARK: - VLC Stream Player
+final class StreamPlayer: NSObject, ObservableObject, VLCMediaPlayerDelegate {
+    @Published var state: StreamState = .idle
 
-private func detectStreamType(_ url: URL) -> StreamType {
-    let path = url.path.lowercased()
-    let ext  = url.pathExtension.lowercased()
-
-    if ext == "m3u8" || path.contains(".m3u8")               { return .hls }
-    if ext == "ts"   || path.contains(".ts")                 { return .mpegTS }
-
-    // Bare numeric path with no extension → almost always MPEG-TS from IPTV panels
-    // e.g. /62927374738998/27137325284748/460878
-    let lastComponent = url.lastPathComponent
-    if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: lastComponent)) {
-        return .mpegTS
-    }
-    return .unknown
-}
-
-// MARK: - Stream Player ViewModel
-final class StreamPlayer: NSObject, ObservableObject {
-    @Published var state: StreamState = .loading
-
-    // Single persistent player — never recreated
-    let player: AVPlayer = {
-        let p = AVPlayer()
-        p.automaticallyWaitsToMinimizeStalling = true
-        // Allow the player to stall longer before giving up
-        p.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    let vlcPlayer: VLCMediaPlayer = {
+        let p = VLCMediaPlayer()
         return p
     }()
 
-    private var currentURL: URL?
-    private var reconnectAttempts  = 0
+    let renderView: UIView = {
+        let v = UIView()
+        v.backgroundColor = .black
+        v.contentMode     = .scaleAspectFit
+        return v
+    }()
+
+    private var currentURL:       URL?
+    private var reconnectAttempts = 0
     private var reconnectTask:    Task<Void, Never>?
-    private var statusObserver:   NSKeyValueObservation?
-    private var rateObserver:     NSKeyValueObservation?
-    private var tcObserver:       NSKeyValueObservation?
+    private var watchdogTask:     Task<Void, Never>?
 
     override init() {
         super.init()
+        vlcPlayer.delegate = self
+        vlcPlayer.drawable = renderView
+        vlcPlayer.scaleFactor = 0  // 0 = fit, keeps 16:9
         activateAudioSession()
     }
 
@@ -69,7 +51,7 @@ final class StreamPlayer: NSObject, ObservableObject {
 
     // MARK: - Public API
     func play(urlString: String) {
-        reconnectTask?.cancel()
+        cancelTasks()
         reconnectAttempts = 0
 
         let cleaned = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -84,135 +66,42 @@ final class StreamPlayer: NSObject, ObservableObject {
 
     func retry() {
         guard let url = currentURL else { return }
-        reconnectTask?.cancel()
+        cancelTasks()
         reconnectAttempts = 0
         DispatchQueue.main.async { self.state = .loading }
         doLoad(url: url)
     }
 
     func stop() {
+        cancelTasks()
+        vlcPlayer.stop()
+        DispatchQueue.main.async { self.state = .idle }
+    }
+
+    private func cancelTasks() {
         reconnectTask?.cancel()
-        statusObserver?.invalidate()
-        rateObserver?.invalidate()
-        tcObserver?.invalidate()
-        NotificationCenter.default.removeObserver(self)
-        player.pause()
-        player.replaceCurrentItem(with: nil)
+        watchdogTask?.cancel()
     }
 
     // MARK: - Core Load
     private func doLoad(url: URL) {
-        let streamType = detectStreamType(url)
+        let media = VLCMedia(url: url)
+        media.addOption("--network-caching=2000")
+        media.addOption("--clock-jitter=0")
+        media.addOption("--clock-synchro=0")
+        media.addOption("--http-reconnect")
+        media.addOption("--http-continuous")
+        media.addOption(":http-user-agent=VLC/3.0.18 LibVLC/3.0.18")
+        media.addOption("--avcodec-hw=any")          // hardware decode
+        media.addOption("--ts-seek-percent")
 
-        // ── Build the correct AVPlayerItem depending on stream type ──
-        let item: AVPlayerItem
+        vlcPlayer.media = media
+        vlcPlayer.play()
 
-        switch streamType {
-
-        // ── HLS: native iOS support ──────────────────────────────────
-        case .hls:
-            let headers: [String: String] = [
-                "User-Agent": "VLC/3.0.18 LibVLC/3.0.18",
-                "Accept":     "*/*",
-                "Connection": "keep-alive"
-            ]
-            let asset = AVURLAsset(url: url, options: [
-                "AVURLAssetHTTPHeaderFieldsKey": headers
-            ])
-            item = AVPlayerItem(asset: asset)
-            item.preferredForwardBufferDuration = 4.0
-
-        // ── MPEG-TS / bare IPTV panel URL ───────────────────────────
-        //    iOS AVPlayer cannot demux raw MPEG-TS natively.
-        //    The trick: wrap the URL in a custom HTTP resource loader
-        //    that re-requests with the right headers and passes the
-        //    raw data back; AVPlayer treats it as a generic stream.
-        //    For panel URLs that are actually HLS-wrapped TS, this
-        //    also works because the server responds with a playlist.
-        case .mpegTS, .unknown:
-            // Attempt 1: try as HLS first (many IPTV panels serve
-            // an HLS playlist even on bare numeric paths)
-            var comps       = URLComponents(url: url, resolvingAgainstBaseURL: false)!
-            // Force http scheme — iOS ATS is already disabled in Info.plist
-            if comps.scheme == nil { comps.scheme = "http" }
-
-            let hlsURL = comps.url ?? url
-            let headers: [String: String] = [
-                "User-Agent":   "VLC/3.0.18 LibVLC/3.0.18",
-                "Accept":       "application/x-mpegURL, video/mp2t, */*",
-                "Connection":   "keep-alive",
-                "Icy-MetaData": "0"
-            ]
-            let asset = AVURLAsset(url: hlsURL, options: [
-                "AVURLAssetHTTPHeaderFieldsKey": headers,
-                // Give AVFoundation longer to probe the format
-                AVURLAssetPreferPreciseDurationAndTimingKey: false
-            ])
-            item = AVPlayerItem(asset: asset)
-            // Shorter buffer → live TV re-syncs faster after reconnect
-            item.preferredForwardBufferDuration = 3.0
-        }
-
-        // ── Observe item status ──────────────────────────────────────
-        statusObserver?.invalidate()
-        statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            guard let self else { return }
-            switch item.status {
-            case .readyToPlay:
-                DispatchQueue.main.async {
-                    self.reconnectAttempts = 0
-                    self.state = .playing
-                }
-                self.player.play()
-            case .failed:
-                let msg = item.error?.localizedDescription ?? "Unknown error"
-                // If we tried as HLS and it failed, schedule reconnect
-                self.scheduleReconnect()
-                print("[StarPlay] Item failed: \(msg)")
-            default:
-                break
-            }
-        }
-
-        // ── Observe timeControlStatus ────────────────────────────────
-        tcObserver?.invalidate()
-        tcObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-            guard let self else { return }
-            DispatchQueue.main.async {
-                switch player.timeControlStatus {
-                case .playing:
-                    self.reconnectAttempts = 0
-                    if self.state != .playing { self.state = .playing }
-                case .waitingToPlayAtSpecifiedRate:
-                    if self.state == .playing { self.state = .buffering }
-                case .paused:
-                    // Force-play for live TV (server hiccup can cause a brief pause)
-                    if player.currentItem?.status == .readyToPlay {
-                        player.play()
-                    }
-                @unknown default:
-                    break
-                }
-            }
-        }
-
-        // ── Notifications ────────────────────────────────────────────
-        let nc = NotificationCenter.default
-        nc.removeObserver(self, name: .AVPlayerItemPlaybackStalled,       object: nil)
-        nc.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime,      object: nil)
-        nc.removeObserver(self, name: .AVPlayerItemFailedToPlayToEndTime, object: nil)
-
-        nc.addObserver(self, selector: #selector(onStall),  name: .AVPlayerItemPlaybackStalled,       object: item)
-        nc.addObserver(self, selector: #selector(onEnd),    name: .AVPlayerItemDidPlayToEndTime,      object: item)
-        nc.addObserver(self, selector: #selector(onFail),   name: .AVPlayerItemFailedToPlayToEndTime, object: item)
-
-        player.replaceCurrentItem(with: item)
-        player.play()
-
-        // ── Watchdog: if still stuck after 20 s, try again ──────────
-        reconnectTask?.cancel()
-        reconnectTask = Task {
-            try? await Task.sleep(nanoseconds: 20_000_000_000) // 20 seconds
+        // Watchdog — 20 s timeout
+        watchdogTask?.cancel()
+        watchdogTask = Task {
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 if self.state == .loading || self.state == .buffering {
@@ -222,23 +111,47 @@ final class StreamPlayer: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Notification Handlers
-    @objc private func onStall() {
-        DispatchQueue.main.async { if self.state == .playing { self.state = .buffering } }
-        scheduleReconnect(delay: 6)
-    }
-    @objc private func onEnd()  { scheduleReconnect(delay: 1.5) }
-    @objc private func onFail() { scheduleReconnect() }
+    // MARK: - VLCMediaPlayerDelegate
+    func mediaPlayerStateChanged(_ aNotification: Notification) {
+        let s = vlcPlayer.state
+        DispatchQueue.main.async {
+            switch s {
+            case .playing:
+                self.cancelTasks()
+                self.reconnectAttempts = 0
+                self.state = .playing
 
-    // MARK: - Reconnect with Exponential Back-off
+            case .buffering:
+                if self.state == .loading || self.state == .reconnecting(self.reconnectAttempts) {
+                    self.state = .buffering
+                }
+
+            case .stopped, .ended:
+                self.scheduleReconnect(delay: 2)
+
+            case .error:
+                self.scheduleReconnect()
+
+            case .paused:
+                self.vlcPlayer.play()
+
+            case .opening:
+                if self.state == .idle { self.state = .loading }
+
+            default:
+                break
+            }
+        }
+    }
+
+    // MARK: - Reconnect
     private func scheduleReconnect(delay overrideDelay: Double? = nil) {
-        reconnectTask?.cancel()
+        cancelTasks()
         reconnectAttempts += 1
 
-        // Cap reconnect at 15 attempts to avoid infinite loop
         if reconnectAttempts > 15 {
             DispatchQueue.main.async {
-                self.state = .error("Stream unavailable after \(self.reconnectAttempts) attempts.\nCheck your connection or try again.")
+                self.state = .error("Stream unavailable after \(self.reconnectAttempts) attempts.\nتعذّر الاتصال بالخادم.")
             }
             return
         }
@@ -256,27 +169,45 @@ final class StreamPlayer: NSObject, ObservableObject {
     deinit { stop() }
 }
 
-// MARK: - AVPlayer UIViewControllerRepresentable
-struct AVPlayerLayerView: UIViewControllerRepresentable {
-    let player: AVPlayer
+// MARK: - VLC UIView wrapper
+struct VLCPlayerView: UIViewRepresentable {
+    let renderView: UIView
 
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let vc = AVPlayerViewController()
-        vc.player               = player
-        vc.showsPlaybackControls = false   // We draw our own overlay
-        vc.videoGravity         = .resizeAspect
-        vc.view.backgroundColor = .black
-        return vc
+    func makeUIView(context: Context) -> UIView {
+        renderView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        return renderView
     }
 
-    func updateUIViewController(_ vc: AVPlayerViewController, context: Context) {
-        vc.player = player
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+// MARK: - Full-screen container UIViewController
+// We present this modally so iOS lets us force landscape freely
+final class FullscreenPlayerVC: UIViewController {
+    var renderView: UIView?
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .landscapeRight }
+    override var shouldAutorotate: Bool { true }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        guard let rv = renderView else { return }
+        rv.frame = view.bounds
+        rv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(rv)
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Return render view to the original host when dismissed
     }
 }
 
 // MARK: - Channel Player Widget
 struct ChannelPlayerWidget: View {
-    let channel: Channel
+    let channel:      Channel
     @Binding var isFullScreen: Bool
     @EnvironmentObject var tm: ThemeManager
 
@@ -285,26 +216,28 @@ struct ChannelPlayerWidget: View {
     @State private var showOverlay       = true
     @State private var overlayTimer: Task<Void, Never>? = nil
 
-    var playerHeight: CGFloat {
-        isFullScreen ? UIScreen.main.bounds.height : 230
-    }
+    // For modal full-screen presentation
+    @State private var showFullscreenModal = false
 
     var body: some View {
         ZStack {
             Color.black
 
-            AVPlayerLayerView(player: sp.player)
+            // VLC video layer — always 16:9
+            VLCPlayerView(renderView: sp.renderView)
+                .aspectRatio(16 / 9, contentMode: .fit)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             // Tap to toggle overlay
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture { toggleOverlay() }
 
-            // Top bar overlay
+            // Top overlay
             if showOverlay {
                 VStack {
                     HStack {
-                        // Live dot + channel name
+                        // LIVE dot + name
                         HStack(spacing: 6) {
                             if case .playing = sp.state {
                                 Circle()
@@ -312,10 +245,10 @@ struct ChannelPlayerWidget: View {
                                     .frame(width: 8, height: 8)
                                     .animation(
                                         .easeInOut(duration: 0.75)
-                                        .repeatForever(autoreverses: true),
+                                            .repeatForever(autoreverses: true),
                                         value: pulseLive
                                     )
-                                    .onAppear  { pulseLive = true  }
+                                    .onAppear    { pulseLive = true  }
                                     .onDisappear { pulseLive = false }
                             }
                             Text(channel.name)
@@ -325,11 +258,9 @@ struct ChannelPlayerWidget: View {
                         }
                         Spacer()
 
-                        // Fullscreen toggle
-                        Button(action: toggleFullScreen) {
-                            Image(systemName: isFullScreen
-                                  ? "arrow.down.right.and.arrow.up.left"
-                                  : "arrow.up.left.and.arrow.down.right")
+                        // Fullscreen button
+                        Button(action: { enterFullscreen() }) {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
                                 .font(.system(size: 17, weight: .medium))
                                 .foregroundColor(tm.c.accent)
                                 .frame(width: 36, height: 36)
@@ -342,8 +273,7 @@ struct ChannelPlayerWidget: View {
                     .background(
                         LinearGradient(
                             colors: [Color.black.opacity(0.7), Color.clear],
-                            startPoint: .top,
-                            endPoint: .bottom
+                            startPoint: .top, endPoint: .bottom
                         )
                     )
                     Spacer()
@@ -352,32 +282,43 @@ struct ChannelPlayerWidget: View {
                 .animation(.easeInOut(duration: 0.2), value: showOverlay)
             }
 
-            // State overlays (loading / buffering / reconnecting / error)
+            // State overlays
             stateOverlay
         }
-        .frame(height: playerHeight)
-        .ignoresSafeArea(edges: isFullScreen ? .all : [])
+        .frame(height: 230)
         .clipped()
         .onAppear    { sp.play(urlString: channel.url) }
         .onChange(of: channel) { sp.play(urlString: $0.url) }
         .onDisappear { sp.stop() }
+        // Present fullscreen as a modal sheet
+        .fullScreenCover(isPresented: $showFullscreenModal) {
+            FullscreenView(sp: sp, channel: channel, isPresented: $showFullscreenModal)
+                .environmentObject(tm)
+        }
+    }
+
+    // MARK: - Enter fullscreen
+    private func enterFullscreen() {
+        isFullScreen = true
+        showFullscreenModal = true
     }
 
     // MARK: - State Overlay
     @ViewBuilder
     private var stateOverlay: some View {
         switch sp.state {
+        case .idle:
+            EmptyView()
 
         case .loading:
             ZStack {
-                Color.black.opacity(0.45)
+                Color.black.opacity(0.5)
                 VStack(spacing: 12) {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: tm.c.accent))
                         .scaleEffect(1.3)
-                    Text("Loading…")
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
+                    Text("جاري التحميل…")
+                        .font(.system(size: 13)).foregroundColor(.white)
                 }
             }
 
@@ -389,8 +330,7 @@ struct ChannelPlayerWidget: View {
                         .progressViewStyle(CircularProgressViewStyle(tint: tm.c.accent))
                         .scaleEffect(1.2)
                     Text("Buffering…")
-                        .font(.system(size: 12))
-                        .foregroundColor(.white)
+                        .font(.system(size: 12)).foregroundColor(.white)
                 }
             }
 
@@ -402,11 +342,9 @@ struct ChannelPlayerWidget: View {
                         .progressViewStyle(CircularProgressViewStyle(tint: tm.c.secondary))
                         .scaleEffect(1.2)
                     Text("Reconnecting… (\(n))")
-                        .font(.system(size: 12))
-                        .foregroundColor(.white)
+                        .font(.system(size: 12)).foregroundColor(.white)
                     Text("جاري إعادة الاتصال…")
-                        .font(.system(size: 11))
-                        .foregroundColor(tm.c.secondary.opacity(0.8))
+                        .font(.system(size: 11)).foregroundColor(tm.c.secondary.opacity(0.8))
                 }
             }
 
@@ -415,29 +353,21 @@ struct ChannelPlayerWidget: View {
                 Color.black.opacity(0.85)
                 VStack(spacing: 14) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 36))
-                        .foregroundColor(tm.c.error)
-
+                        .font(.system(size: 36)).foregroundColor(tm.c.error)
                     Text("Playback Failed")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(.white)
-
+                        .font(.system(size: 16, weight: .bold)).foregroundColor(.white)
                     Text("تعذّر تشغيل القناة")
-                        .font(.system(size: 13))
-                        .foregroundColor(tm.c.error.opacity(0.8))
-
-                    Text(msg.isEmpty ? "Stream may be offline or unsupported." : msg)
+                        .font(.system(size: 13)).foregroundColor(tm.c.error.opacity(0.8))
+                    Text(msg.isEmpty ? "Stream may be offline." : msg)
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "A0A0A0"))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
-
                     Button(action: { sp.retry() }) {
                         Label("Retry / إعادة المحاولة", systemImage: "arrow.clockwise")
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(tm.c.background)
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 10)
+                            .padding(.horizontal, 20).padding(.vertical, 10)
                             .background(tm.c.accent)
                             .cornerRadius(10)
                     }
@@ -460,28 +390,211 @@ struct ChannelPlayerWidget: View {
     private func startOverlayTimer() {
         overlayTimer?.cancel()
         overlayTimer = Task {
-            try? await Task.sleep(nanoseconds: 4_000_000_000) // 4 s
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
             guard !Task.isCancelled else { return }
-            await MainActor.run {
-                withAnimation { showOverlay = false }
-            }
+            await MainActor.run { withAnimation { showOverlay = false } }
         }
-    }
-
-    // MARK: - Full Screen
-    private func toggleFullScreen() {
-        withAnimation(.easeInOut(duration: 0.25)) {
-            isFullScreen.toggle()
-        }
-        setOrientation(isFullScreen ? .landscape : .portrait)
-        if isFullScreen { startOverlayTimer() }
     }
 }
 
-// MARK: - Inline Player Placeholder
-struct PlayerPlaceholder: View {
+// MARK: - Fullscreen Modal View (forces landscape)
+struct FullscreenView: View {
+    @ObservedObject var sp: StreamPlayer
+    let channel: Channel
+    @Binding var isPresented: Bool
     @EnvironmentObject var tm: ThemeManager
 
+    @State private var showControls  = true
+    @State private var pulseLive     = false
+    @State private var controlTimer: Task<Void, Never>? = nil
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            // Video — fills screen, 16:9 centered
+            VLCPlayerView(renderView: sp.renderView)
+                .aspectRatio(16 / 9, contentMode: .fit)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+
+            // Tap to toggle controls
+            Color.clear
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture { toggleControls() }
+
+            // Controls overlay
+            if showControls {
+                VStack {
+                    // Top bar
+                    HStack {
+                        // Close fullscreen
+                        Button(action: { exitFullscreen() }) {
+                            Image(systemName: "arrow.down.right.and.arrow.up.left")
+                                .font(.system(size: 18, weight: .medium))
+                                .foregroundColor(.white)
+                                .frame(width: 40, height: 40)
+                                .background(Color.black.opacity(0.55))
+                                .clipShape(Circle())
+                        }
+
+                        Spacer()
+
+                        // Channel name + LIVE dot
+                        HStack(spacing: 6) {
+                            if case .playing = sp.state {
+                                Circle()
+                                    .fill(tm.c.live.opacity(pulseLive ? 1 : 0.3))
+                                    .frame(width: 8, height: 8)
+                                    .animation(
+                                        .easeInOut(duration: 0.75).repeatForever(autoreverses: true),
+                                        value: pulseLive
+                                    )
+                                    .onAppear    { pulseLive = true  }
+                                    .onDisappear { pulseLive = false }
+                            }
+                            Text(channel.name)
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+
+                        Spacer()
+
+                        // Retry button
+                        Button(action: { sp.retry() }) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundColor(.white)
+                                .frame(width: 40, height: 40)
+                                .background(Color.black.opacity(0.55))
+                                .clipShape(Circle())
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                    .background(
+                        LinearGradient(
+                            colors: [Color.black.opacity(0.7), Color.clear],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+
+                    Spacer()
+                }
+                .transition(.opacity)
+                .animation(.easeInOut(duration: 0.2), value: showControls)
+            }
+
+            // State overlays inside fullscreen too
+            fullscreenStateOverlay
+        }
+        // Force landscape on appear
+        .onAppear {
+            forceOrientation(.landscapeRight)
+            startControlTimer()
+        }
+        .onDisappear {
+            forceOrientation(.portrait)
+        }
+    }
+
+    // MARK: - Force orientation
+    private func forceOrientation(_ orientation: UIInterfaceOrientation) {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+        let mask: UIInterfaceOrientationMask = orientation == .portrait ? .portrait : .landscape
+        AppDelegate.orientationLock = mask
+        let pref = UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: mask)
+        scene.requestGeometryUpdate(pref) { _ in }
+        scene.windows.forEach {
+            $0.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
+    }
+
+    // MARK: - Exit fullscreen
+    private func exitFullscreen() {
+        controlTimer?.cancel()
+        isPresented = false
+    }
+
+    // MARK: - Controls timer
+    private func toggleControls() {
+        controlTimer?.cancel()
+        withAnimation { showControls.toggle() }
+        if showControls { startControlTimer() }
+    }
+
+    private func startControlTimer() {
+        controlTimer?.cancel()
+        controlTimer = Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { withAnimation { showControls = false } }
+        }
+    }
+
+    // MARK: - State overlay in fullscreen
+    @ViewBuilder
+    private var fullscreenStateOverlay: some View {
+        switch sp.state {
+        case .loading:
+            ZStack {
+                Color.black.opacity(0.45)
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: tm.c.accent))
+                        .scaleEffect(1.5)
+                    Text("جاري التحميل…")
+                        .font(.system(size: 15)).foregroundColor(.white)
+                }
+            }
+        case .buffering:
+            ZStack {
+                Color.black.opacity(0.35)
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: tm.c.accent))
+                    .scaleEffect(1.4)
+            }
+        case .reconnecting(let n):
+            ZStack {
+                Color.black.opacity(0.55)
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: tm.c.secondary))
+                        .scaleEffect(1.4)
+                    Text("Reconnecting… (\(n))")
+                        .font(.system(size: 14)).foregroundColor(.white)
+                }
+            }
+        case .error(let msg):
+            ZStack {
+                Color.black.opacity(0.85)
+                VStack(spacing: 16) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 44)).foregroundColor(tm.c.error)
+                    Text("تعذّر تشغيل القناة")
+                        .font(.system(size: 18, weight: .bold)).foregroundColor(.white)
+                    Text(msg).font(.system(size: 13))
+                        .foregroundColor(Color(hex: "A0A0A0"))
+                        .multilineTextAlignment(.center).padding(.horizontal, 40)
+                    Button(action: { sp.retry() }) {
+                        Label("إعادة المحاولة", systemImage: "arrow.clockwise")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(tm.c.background)
+                            .padding(.horizontal, 24).padding(.vertical, 12)
+                            .background(tm.c.accent).cornerRadius(12)
+                    }
+                }
+            }
+        default:
+            EmptyView()
+        }
+    }
+}
+
+// MARK: - Player Placeholder
+struct PlayerPlaceholder: View {
+    @EnvironmentObject var tm: ThemeManager
     var body: some View {
         ZStack {
             Color.black
@@ -490,11 +603,9 @@ struct PlayerPlaceholder: View {
                     .font(.system(size: 40))
                     .foregroundColor(tm.c.accent.opacity(0.5))
                 Text("اختر قناة للمشاهدة")
-                    .font(.system(size: 14))
-                    .foregroundColor(tm.c.textMuted)
+                    .font(.system(size: 14)).foregroundColor(tm.c.textMuted)
                 Text("Select a channel to watch")
-                    .font(.system(size: 12))
-                    .foregroundColor(tm.c.textMuted.opacity(0.6))
+                    .font(.system(size: 12)).foregroundColor(tm.c.textMuted.opacity(0.6))
             }
         }
         .frame(height: 230)
