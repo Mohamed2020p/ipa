@@ -37,16 +37,8 @@ final class StreamPlayer: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         super.init()
         vlcPlayer.delegate = self
         vlcPlayer.drawable = renderView
-        vlcPlayer.scaleFactor = 0  // 0 = fit, keeps 16:9
-        activateAudioSession()
-    }
-
-    private func activateAudioSession() {
-        try? AVAudioSession.sharedInstance().setCategory(
-            .playback, mode: .moviePlayback,
-            options: [.allowBluetooth, .allowAirPlay]
-        )
-        try? AVAudioSession.sharedInstance().setActive(true)
+        vlcPlayer.scaleFactor = 0
+        // Audio session is handled globally by AppDelegate
     }
 
     // MARK: - Public API
@@ -92,13 +84,12 @@ final class StreamPlayer: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         media.addOption("--http-reconnect")
         media.addOption("--http-continuous")
         media.addOption(":http-user-agent=VLC/3.0.18 LibVLC/3.0.18")
-        media.addOption("--avcodec-hw=any")          // hardware decode
+        media.addOption("--avcodec-hw=any")
         media.addOption("--ts-seek-percent")
 
         vlcPlayer.media = media
         vlcPlayer.play()
 
-        // Watchdog — 20 s timeout
         watchdogTask?.cancel()
         watchdogTask = Task {
             try? await Task.sleep(nanoseconds: 20_000_000_000)
@@ -182,7 +173,6 @@ struct VLCPlayerView: UIViewRepresentable {
 }
 
 // MARK: - Full-screen container UIViewController
-// We present this modally so iOS lets us force landscape freely
 final class FullscreenPlayerVC: UIViewController {
     var renderView: UIView?
 
@@ -198,11 +188,6 @@ final class FullscreenPlayerVC: UIViewController {
         rv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(rv)
     }
-
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        // Return render view to the original host when dismissed
-    }
 }
 
 // MARK: - Channel Player Widget
@@ -215,29 +200,23 @@ struct ChannelPlayerWidget: View {
     @State private var pulseLive         = false
     @State private var showOverlay       = true
     @State private var overlayTimer: Task<Void, Never>? = nil
-
-    // For modal full-screen presentation
     @State private var showFullscreenModal = false
 
     var body: some View {
         ZStack {
             Color.black
 
-            // VLC video layer — always 16:9
             VLCPlayerView(renderView: sp.renderView)
                 .aspectRatio(16 / 9, contentMode: .fit)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            // Tap to toggle overlay
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture { toggleOverlay() }
 
-            // Top overlay
             if showOverlay {
                 VStack {
                     HStack {
-                        // LIVE dot + name
                         HStack(spacing: 6) {
                             if case .playing = sp.state {
                                 Circle()
@@ -258,7 +237,6 @@ struct ChannelPlayerWidget: View {
                         }
                         Spacer()
 
-                        // Fullscreen button
                         Button(action: { enterFullscreen() }) {
                             Image(systemName: "arrow.up.left.and.arrow.down.right")
                                 .font(.system(size: 17, weight: .medium))
@@ -282,7 +260,6 @@ struct ChannelPlayerWidget: View {
                 .animation(.easeInOut(duration: 0.2), value: showOverlay)
             }
 
-            // State overlays
             stateOverlay
         }
         .frame(height: 230)
@@ -290,20 +267,17 @@ struct ChannelPlayerWidget: View {
         .onAppear    { sp.play(urlString: channel.url) }
         .onChange(of: channel) { sp.play(urlString: $0.url) }
         .onDisappear { sp.stop() }
-        // Present fullscreen as a modal sheet
         .fullScreenCover(isPresented: $showFullscreenModal) {
             FullscreenView(sp: sp, channel: channel, isPresented: $showFullscreenModal)
                 .environmentObject(tm)
         }
     }
 
-    // MARK: - Enter fullscreen
     private func enterFullscreen() {
         isFullScreen = true
         showFullscreenModal = true
     }
 
-    // MARK: - State Overlay
     @ViewBuilder
     private var stateOverlay: some View {
         switch sp.state {
@@ -380,7 +354,6 @@ struct ChannelPlayerWidget: View {
         }
     }
 
-    // MARK: - Overlay Timer
     private func toggleOverlay() {
         overlayTimer?.cancel()
         withAnimation { showOverlay.toggle() }
@@ -397,7 +370,7 @@ struct ChannelPlayerWidget: View {
     }
 }
 
-// MARK: - Fullscreen Modal View (forces landscape)
+// MARK: - Fullscreen Modal View
 struct FullscreenView: View {
     @ObservedObject var sp: StreamPlayer
     let channel: Channel
@@ -412,24 +385,19 @@ struct FullscreenView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // Video — fills screen, 16:9 centered
             VLCPlayerView(renderView: sp.renderView)
                 .aspectRatio(16 / 9, contentMode: .fit)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
 
-            // Tap to toggle controls
             Color.clear
                 .contentShape(Rectangle())
                 .ignoresSafeArea()
                 .onTapGesture { toggleControls() }
 
-            // Controls overlay
             if showControls {
                 VStack {
-                    // Top bar
                     HStack {
-                        // Close fullscreen
                         Button(action: { exitFullscreen() }) {
                             Image(systemName: "arrow.down.right.and.arrow.up.left")
                                 .font(.system(size: 18, weight: .medium))
@@ -441,7 +409,6 @@ struct FullscreenView: View {
 
                         Spacer()
 
-                        // Channel name + LIVE dot
                         HStack(spacing: 6) {
                             if case .playing = sp.state {
                                 Circle()
@@ -461,7 +428,6 @@ struct FullscreenView: View {
 
                         Spacer()
 
-                        // Retry button
                         Button(action: { sp.retry() }) {
                             Image(systemName: "arrow.clockwise")
                                 .font(.system(size: 16, weight: .medium))
@@ -486,10 +452,8 @@ struct FullscreenView: View {
                 .animation(.easeInOut(duration: 0.2), value: showControls)
             }
 
-            // State overlays inside fullscreen too
             fullscreenStateOverlay
         }
-        // Force landscape on appear
         .onAppear {
             forceOrientation(.landscapeRight)
             startControlTimer()
@@ -499,7 +463,6 @@ struct FullscreenView: View {
         }
     }
 
-    // MARK: - Force orientation
     private func forceOrientation(_ orientation: UIInterfaceOrientation) {
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
         let mask: UIInterfaceOrientationMask = orientation == .portrait ? .portrait : .landscape
@@ -511,13 +474,11 @@ struct FullscreenView: View {
         }
     }
 
-    // MARK: - Exit fullscreen
     private func exitFullscreen() {
         controlTimer?.cancel()
         isPresented = false
     }
 
-    // MARK: - Controls timer
     private func toggleControls() {
         controlTimer?.cancel()
         withAnimation { showControls.toggle() }
@@ -533,7 +494,6 @@ struct FullscreenView: View {
         }
     }
 
-    // MARK: - State overlay in fullscreen
     @ViewBuilder
     private var fullscreenStateOverlay: some View {
         switch sp.state {
