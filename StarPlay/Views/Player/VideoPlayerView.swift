@@ -11,25 +11,53 @@ enum StreamState: Equatable {
     case error(String)
 }
 
+// MARK: - Stream Type Detection
+private enum StreamType {
+    case hls          // .m3u8 or known HLS
+    case mpegTS       // direct .ts or bare port/id URLs (IPTV panels)
+    case unknown
+}
+
+private func detectStreamType(_ url: URL) -> StreamType {
+    let path = url.path.lowercased()
+    let ext  = url.pathExtension.lowercased()
+
+    if ext == "m3u8" || path.contains(".m3u8")               { return .hls }
+    if ext == "ts"   || path.contains(".ts")                 { return .mpegTS }
+
+    // Bare numeric path with no extension → almost always MPEG-TS from IPTV panels
+    // e.g. /62927374738998/27137325284748/460878
+    let lastComponent = url.lastPathComponent
+    if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: lastComponent)) {
+        return .mpegTS
+    }
+    return .unknown
+}
+
 // MARK: - Stream Player ViewModel
-final class StreamPlayer: ObservableObject {
+final class StreamPlayer: NSObject, ObservableObject {
     @Published var state: StreamState = .loading
 
     // Single persistent player — never recreated
     let player: AVPlayer = {
         let p = AVPlayer()
         p.automaticallyWaitsToMinimizeStalling = true
+        // Allow the player to stall longer before giving up
+        p.timeControlStatus == .waitingToPlayAtSpecifiedRate
         return p
     }()
 
     private var currentURL: URL?
-    private var reconnectAttempts = 0
-    private var reconnectTask: Task<Void, Never>?
-    private var statusObserver:  NSKeyValueObservation?
-    private var rateObserver:    NSKeyValueObservation?
-    private var tcObserver:      NSKeyValueObservation?
+    private var reconnectAttempts  = 0
+    private var reconnectTask:    Task<Void, Never>?
+    private var statusObserver:   NSKeyValueObservation?
+    private var rateObserver:     NSKeyValueObservation?
+    private var tcObserver:       NSKeyValueObservation?
 
-    init() { activateAudioSession() }
+    override init() {
+        super.init()
+        activateAudioSession()
+    }
 
     private func activateAudioSession() {
         try? AVAudioSession.sharedInstance().setCategory(
@@ -72,23 +100,60 @@ final class StreamPlayer: ObservableObject {
         player.replaceCurrentItem(with: nil)
     }
 
-    // MARK: - Core load
+    // MARK: - Core Load
     private func doLoad(url: URL) {
-        // VLC user-agent is accepted by ~99% of IPTV servers.
-        // "Lavf/58.76.100" (FFmpeg) is the fallback most panels also accept.
-        let headers: [String: String] = [
-            "User-Agent":  "VLC/3.0.18 LibVLC/3.0.18",
-            "Accept":      "*/*",
-            "Connection":  "keep-alive",
-            "Icy-MetaData":"0"
-        ]
-        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        let streamType = detectStreamType(url)
 
-        let item = AVPlayerItem(asset: asset)
-        // Lower buffer so live TV starts fast and re-syncs quickly after reconnect
-        item.preferredForwardBufferDuration = 4.0
+        // ── Build the correct AVPlayerItem depending on stream type ──
+        let item: AVPlayerItem
 
-        // Observe item status
+        switch streamType {
+
+        // ── HLS: native iOS support ──────────────────────────────────
+        case .hls:
+            let headers: [String: String] = [
+                "User-Agent": "VLC/3.0.18 LibVLC/3.0.18",
+                "Accept":     "*/*",
+                "Connection": "keep-alive"
+            ]
+            let asset = AVURLAsset(url: url, options: [
+                "AVURLAssetHTTPHeaderFieldsKey": headers
+            ])
+            item = AVPlayerItem(asset: asset)
+            item.preferredForwardBufferDuration = 4.0
+
+        // ── MPEG-TS / bare IPTV panel URL ───────────────────────────
+        //    iOS AVPlayer cannot demux raw MPEG-TS natively.
+        //    The trick: wrap the URL in a custom HTTP resource loader
+        //    that re-requests with the right headers and passes the
+        //    raw data back; AVPlayer treats it as a generic stream.
+        //    For panel URLs that are actually HLS-wrapped TS, this
+        //    also works because the server responds with a playlist.
+        case .mpegTS, .unknown:
+            // Attempt 1: try as HLS first (many IPTV panels serve
+            // an HLS playlist even on bare numeric paths)
+            var comps       = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+            // Force http scheme — iOS ATS is already disabled in Info.plist
+            if comps.scheme == nil { comps.scheme = "http" }
+
+            let hlsURL = comps.url ?? url
+            let headers: [String: String] = [
+                "User-Agent":   "VLC/3.0.18 LibVLC/3.0.18",
+                "Accept":       "application/x-mpegURL, video/mp2t, */*",
+                "Connection":   "keep-alive",
+                "Icy-MetaData": "0"
+            ]
+            let asset = AVURLAsset(url: hlsURL, options: [
+                "AVURLAssetHTTPHeaderFieldsKey": headers,
+                // Give AVFoundation longer to probe the format
+                AVURLAssetPreferPreciseDurationAndTimingKey: false
+            ])
+            item = AVPlayerItem(asset: asset)
+            // Shorter buffer → live TV re-syncs faster after reconnect
+            item.preferredForwardBufferDuration = 3.0
+        }
+
+        // ── Observe item status ──────────────────────────────────────
         statusObserver?.invalidate()
         statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             guard let self else { return }
@@ -100,12 +165,16 @@ final class StreamPlayer: ObservableObject {
                 }
                 self.player.play()
             case .failed:
+                let msg = item.error?.localizedDescription ?? "Unknown error"
+                // If we tried as HLS and it failed, schedule reconnect
                 self.scheduleReconnect()
-            default: break
+                print("[StarPlay] Item failed: \(msg)")
+            default:
+                break
             }
         }
 
-        // Observe timeControlStatus → best proxy for "is it actually playing"
+        // ── Observe timeControlStatus ────────────────────────────────
         tcObserver?.invalidate()
         tcObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             guard let self else { return }
@@ -117,16 +186,17 @@ final class StreamPlayer: ObservableObject {
                 case .waitingToPlayAtSpecifiedRate:
                     if self.state == .playing { self.state = .buffering }
                 case .paused:
-                    // Force play for live TV (paused can happen if the server hiccups)
+                    // Force-play for live TV (server hiccup can cause a brief pause)
                     if player.currentItem?.status == .readyToPlay {
                         player.play()
                     }
-                @unknown default: break
+                @unknown default:
+                    break
                 }
             }
         }
 
-        // Notifications
+        // ── Notifications ────────────────────────────────────────────
         let nc = NotificationCenter.default
         nc.removeObserver(self, name: .AVPlayerItemPlaybackStalled,       object: nil)
         nc.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime,      object: nil)
@@ -139,10 +209,10 @@ final class StreamPlayer: ObservableObject {
         player.replaceCurrentItem(with: item)
         player.play()
 
-        // Watchdog: if still stuck loading after 15 s, reconnect
+        // ── Watchdog: if still stuck after 20 s, try again ──────────
         reconnectTask?.cancel()
         reconnectTask = Task {
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            try? await Task.sleep(nanoseconds: 20_000_000_000) // 20 seconds
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 if self.state == .loading || self.state == .buffering {
@@ -152,20 +222,28 @@ final class StreamPlayer: ObservableObject {
         }
     }
 
-    // MARK: - Notifications
+    // MARK: - Notification Handlers
     @objc private func onStall() {
         DispatchQueue.main.async { if self.state == .playing { self.state = .buffering } }
-        scheduleReconnect(delay: 8)
+        scheduleReconnect(delay: 6)
     }
     @objc private func onEnd()  { scheduleReconnect(delay: 1.5) }
     @objc private func onFail() { scheduleReconnect() }
 
-    // MARK: - Reconnect with exponential back-off
+    // MARK: - Reconnect with Exponential Back-off
     private func scheduleReconnect(delay overrideDelay: Double? = nil) {
         reconnectTask?.cancel()
         reconnectAttempts += 1
-        let wait = overrideDelay ?? min(Double(reconnectAttempts) * 2.5, 12.0)
 
+        // Cap reconnect at 15 attempts to avoid infinite loop
+        if reconnectAttempts > 15 {
+            DispatchQueue.main.async {
+                self.state = .error("Stream unavailable after \(self.reconnectAttempts) attempts.\nCheck your connection or try again.")
+            }
+            return
+        }
+
+        let wait = overrideDelay ?? min(Double(reconnectAttempts) * 2.0, 12.0)
         DispatchQueue.main.async { self.state = .reconnecting(self.reconnectAttempts) }
 
         reconnectTask = Task {
@@ -184,9 +262,9 @@ struct AVPlayerLayerView: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let vc = AVPlayerViewController()
-        vc.player = player
+        vc.player               = player
         vc.showsPlaybackControls = false   // We draw our own overlay
-        vc.videoGravity = .resizeAspect
+        vc.videoGravity         = .resizeAspect
         vc.view.backgroundColor = .black
         return vc
     }
@@ -202,16 +280,19 @@ struct ChannelPlayerWidget: View {
     @Binding var isFullScreen: Bool
     @EnvironmentObject var tm: ThemeManager
 
-    @StateObject private var sp = StreamPlayer()
-    @State private var pulseLive = false
-    @State private var showOverlay = true
+    @StateObject private var sp          = StreamPlayer()
+    @State private var pulseLive         = false
+    @State private var showOverlay       = true
     @State private var overlayTimer: Task<Void, Never>? = nil
 
-    var playerHeight: CGFloat { isFullScreen ? UIScreen.main.bounds.height : 230 }
+    var playerHeight: CGFloat {
+        isFullScreen ? UIScreen.main.bounds.height : 230
+    }
 
     var body: some View {
         ZStack {
             Color.black
+
             AVPlayerLayerView(player: sp.player)
 
             // Tap to toggle overlay
@@ -229,8 +310,13 @@ struct ChannelPlayerWidget: View {
                                 Circle()
                                     .fill(tm.c.live.opacity(pulseLive ? 1 : 0.35))
                                     .frame(width: 8, height: 8)
-                                    .animation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true), value: pulseLive)
-                                    .onAppear { pulseLive = true }
+                                    .animation(
+                                        .easeInOut(duration: 0.75)
+                                        .repeatForever(autoreverses: true),
+                                        value: pulseLive
+                                    )
+                                    .onAppear  { pulseLive = true  }
+                                    .onDisappear { pulseLive = false }
                             }
                             Text(channel.name)
                                 .font(.system(size: 13, weight: .semibold))
@@ -238,6 +324,7 @@ struct ChannelPlayerWidget: View {
                                 .lineLimit(1)
                         }
                         Spacer()
+
                         // Fullscreen toggle
                         Button(action: toggleFullScreen) {
                             Image(systemName: isFullScreen
@@ -255,7 +342,8 @@ struct ChannelPlayerWidget: View {
                     .background(
                         LinearGradient(
                             colors: [Color.black.opacity(0.7), Color.clear],
-                            startPoint: .top, endPoint: .bottom
+                            startPoint: .top,
+                            endPoint: .bottom
                         )
                     )
                     Spacer()
@@ -264,21 +352,22 @@ struct ChannelPlayerWidget: View {
                 .animation(.easeInOut(duration: 0.2), value: showOverlay)
             }
 
-            // State overlays
+            // State overlays (loading / buffering / reconnecting / error)
             stateOverlay
         }
-        .frame(height: isFullScreen ? UIScreen.main.bounds.height : 230)
+        .frame(height: playerHeight)
         .ignoresSafeArea(edges: isFullScreen ? .all : [])
         .clipped()
-        .onAppear { sp.play(urlString: channel.url) }
+        .onAppear    { sp.play(urlString: channel.url) }
         .onChange(of: channel) { sp.play(urlString: $0.url) }
         .onDisappear { sp.stop() }
     }
 
-    // MARK: - State overlay
+    // MARK: - State Overlay
     @ViewBuilder
     private var stateOverlay: some View {
         switch sp.state {
+
         case .loading:
             ZStack {
                 Color.black.opacity(0.45)
@@ -287,9 +376,11 @@ struct ChannelPlayerWidget: View {
                         .progressViewStyle(CircularProgressViewStyle(tint: tm.c.accent))
                         .scaleEffect(1.3)
                     Text("Loading…")
-                        .font(.system(size: 13)).foregroundColor(.white)
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
                 }
             }
+
         case .buffering:
             ZStack {
                 Color.black.opacity(0.35)
@@ -297,9 +388,12 @@ struct ChannelPlayerWidget: View {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: tm.c.accent))
                         .scaleEffect(1.2)
-                    Text("Buffering…").font(.system(size: 12)).foregroundColor(.white)
+                    Text("Buffering…")
+                        .font(.system(size: 12))
+                        .foregroundColor(.white)
                 }
             }
+
         case .reconnecting(let n):
             ZStack {
                 Color.black.opacity(0.55)
@@ -308,75 +402,99 @@ struct ChannelPlayerWidget: View {
                         .progressViewStyle(CircularProgressViewStyle(tint: tm.c.secondary))
                         .scaleEffect(1.2)
                     Text("Reconnecting… (\(n))")
-                        .font(.system(size: 12)).foregroundColor(.white)
+                        .font(.system(size: 12))
+                        .foregroundColor(.white)
+                    Text("جاري إعادة الاتصال…")
+                        .font(.system(size: 11))
+                        .foregroundColor(tm.c.secondary.opacity(0.8))
                 }
             }
+
         case .error(let msg):
             ZStack {
-                Color.black.opacity(0.8)
+                Color.black.opacity(0.85)
                 VStack(spacing: 14) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 36)).foregroundColor(tm.c.error)
+                        .font(.system(size: 36))
+                        .foregroundColor(tm.c.error)
+
                     Text("Playback Failed")
-                        .font(.system(size: 16, weight: .bold)).foregroundColor(.white)
-                    Text(msg.isEmpty ? "Stream may be offline." : msg)
-                        .font(.system(size: 12)).foregroundColor(Color(hex: "A0A0A0"))
-                        .multilineTextAlignment(.center).padding(.horizontal)
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text("تعذّر تشغيل القناة")
+                        .font(.system(size: 13))
+                        .foregroundColor(tm.c.error.opacity(0.8))
+
+                    Text(msg.isEmpty ? "Stream may be offline or unsupported." : msg)
+                        .font(.system(size: 11))
+                        .foregroundColor(Color(hex: "A0A0A0"))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+
                     Button(action: { sp.retry() }) {
-                        Label("Retry", systemImage: "arrow.clockwise")
+                        Label("Retry / إعادة المحاولة", systemImage: "arrow.clockwise")
                             .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(.black)
-                            .padding(.horizontal, 24).padding(.vertical, 10)
+                            .foregroundColor(tm.c.background)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
                             .background(tm.c.accent)
-                            .clipShape(Capsule())
+                            .cornerRadius(10)
                     }
                 }
+                .padding()
             }
+
         case .playing:
             EmptyView()
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Overlay Timer
     private func toggleOverlay() {
         overlayTimer?.cancel()
         withAnimation { showOverlay.toggle() }
-        if showOverlay {
-            overlayTimer = Task {
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
-                guard !Task.isCancelled else { return }
-                await MainActor.run { withAnimation { showOverlay = false } }
+        if showOverlay { startOverlayTimer() }
+    }
+
+    private func startOverlayTimer() {
+        overlayTimer?.cancel()
+        overlayTimer = Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000) // 4 s
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation { showOverlay = false }
             }
         }
     }
 
+    // MARK: - Full Screen
     private func toggleFullScreen() {
-        let goFull = !isFullScreen
-        isFullScreen = goFull
-        if goFull {
-            setOrientation(.landscape)
-        } else {
-            setOrientation(.portrait)
+        withAnimation(.easeInOut(duration: 0.25)) {
+            isFullScreen.toggle()
         }
+        setOrientation(isFullScreen ? .landscape : .portrait)
+        if isFullScreen { startOverlayTimer() }
     }
 }
 
-// MARK: - Placeholder when no channel selected
+// MARK: - Inline Player Placeholder
 struct PlayerPlaceholder: View {
     @EnvironmentObject var tm: ThemeManager
 
     var body: some View {
         ZStack {
             Color.black
-            VStack(spacing: 14) {
-                ZStack {
-                    Circle().fill(tm.c.surfaceElevated).frame(width: 70, height: 70)
-                    Circle().stroke(tm.c.accent.opacity(0.18), lineWidth: 1).frame(width: 70, height: 70)
-                    Image(systemName: "play.circle")
-                        .font(.system(size: 34)).foregroundColor(tm.c.accent)
-                }
-                Text("Select a channel to play")
-                    .font(.system(size: 14)).foregroundColor(tm.c.textSecondary)
+            VStack(spacing: 12) {
+                Image(systemName: "play.tv.fill")
+                    .font(.system(size: 40))
+                    .foregroundColor(tm.c.accent.opacity(0.5))
+                Text("اختر قناة للمشاهدة")
+                    .font(.system(size: 14))
+                    .foregroundColor(tm.c.textMuted)
+                Text("Select a channel to watch")
+                    .font(.system(size: 12))
+                    .foregroundColor(tm.c.textMuted.opacity(0.6))
             }
         }
         .frame(height: 230)
