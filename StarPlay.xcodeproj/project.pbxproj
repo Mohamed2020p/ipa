@@ -204,7 +204,7 @@
 			knownRegions = (en, ar, Base);
 			mainGroup = B4000000;
 			packageReferences = (
-				B9000001 /* XCRemoteSwiftPackageReference "VLCKit" */,
+				B9000001 /* XCRemoteSwiftPackageReference "MobileVLCKit-SPM" */,
 			);
 			productRefGroup = B4000003 /* Products */;
 			projectDirPath = "";
@@ -367,12 +367,12 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		B9000001 /* XCRemoteSwiftPackageReference "VLCKit" */ = {
+		B9000001 /* XCRemoteSwiftPackageReference "MobileVLCKit-SPM" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://code.videolan.org/videolan/VLCKit";
+			repositoryURL = "https://github.com/showbie/MobileVLCKit-SPM";
 			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 4.0.0;
+				kind = exactVersion;
+				version = 3.7.3;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -380,7 +380,7 @@
 /* Begin XCSwiftPackageProductDependency section */
 		B9000002 /* MobileVLCKit */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = B9000001 /* XCRemoteSwiftPackageReference "VLCKit" */;
+			package = B9000001 /* XCRemoteSwiftPackageReference "MobileVLCKit-SPM" */;
 			productName = MobileVLCKit;
 		};
 /* End XCSwiftPackageProductDependency section */
