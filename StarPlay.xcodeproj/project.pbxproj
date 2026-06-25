@@ -25,6 +25,7 @@
 		B1000030 /* Assets.xcassets in Resources */          = {isa = PBXBuildFile; fileRef = B2000030; };
 		B1000020 /* AVFoundation.framework in Frameworks */  = {isa = PBXBuildFile; fileRef = B2000020; };
 		B1000021 /* AVKit.framework in Frameworks */         = {isa = PBXBuildFile; fileRef = B2000021; };
+		B1000040 /* MobileVLCKit in Frameworks */            = {isa = PBXBuildFile; productRef = B9000002; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -57,6 +58,7 @@
 			files = (
 				B1000020 /* AVFoundation.framework in Frameworks */,
 				B1000021 /* AVKit.framework in Frameworks */,
+				B1000040 /* MobileVLCKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -175,6 +177,9 @@
 			buildRules = ();
 			dependencies = ();
 			name = StarPlay;
+			packageProductDependencies = (
+				B9000002 /* MobileVLCKit */,
+			);
 			productName = StarPlay;
 			productReference = B2000018 /* StarPlay.app */;
 			productType = "com.apple.product-type.application";
@@ -198,6 +203,9 @@
 			hasScannedForEncodings = 0;
 			knownRegions = (en, ar, Base);
 			mainGroup = B4000000;
+			packageReferences = (
+				B9000001 /* XCRemoteSwiftPackageReference "VLCKit" */,
+			);
 			productRefGroup = B4000003 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -357,6 +365,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B9000001 /* XCRemoteSwiftPackageReference "VLCKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://code.videolan.org/videolan/VLCKit";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 4.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B9000002 /* MobileVLCKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B9000001 /* XCRemoteSwiftPackageReference "VLCKit" */;
+			productName = MobileVLCKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 	};
 	rootObject = B7000001 /* Project object */;
